@@ -1071,9 +1071,9 @@ def _build_summary_text(result: ScanResult) -> str:
 
     auth_flags = []
     if any(r.has_bearer      for r in result.requests): auth_flags.append("🔑 Bearer")
-    if any(r.has_api_key     for r in result.requests): auth_flags.append("🗝 API\\-Key")
+    if any(r.has_api_key     for r in result.requests): auth_flags.append("🗝 API-Key")
     if any(r.has_csrf        for r in result.requests): auth_flags.append("🛡 CSRF")
-    if any(r.has_cookie_auth for r in result.requests): auth_flags.append("🍪 Cookie\\-Auth")
+    if any(r.has_cookie_auth for r in result.requests): auth_flags.append("🍪 Cookie-Auth")
 
     lines = [
         f"✅ *Scan complete*  `[{_esc(result.scan_id)}]`  {elapsed:.1f}s",
@@ -1109,7 +1109,7 @@ def _build_summary_text(result: ScanResult) -> str:
     if auth_cookies:
         lines.append("")
         lines.append(f"🍪 *Session Cookies* ({len(result.session_cookies)} total, "
-                     f"{len(auth_cookies)} auth):*")
+                     f"{len(auth_cookies)} auth-related):")
         lines.append("```")
         for ck in auth_cookies[:6]:
             flags = ""
@@ -1172,7 +1172,7 @@ def _build_summary_text(result: ScanResult) -> str:
     # ── ⑫ Payment fill report ─────────────────────────────────────────────
     if fill_report:
         lines.append("")
-        lines.append(f"⚡ *Payment Form Auto\\-Fill:* {len(fill_report)} field(s) filled with fake card data")
+        lines.append(f"⚡ *Payment Form Auto-Fill:* {len(fill_report)} field(s) filled with fake card data")
         lines.append("```")
         for fname, info in list(fill_report.items())[:8]:
             lines.append(f'  "{_esc_raw(fname)}": "{_esc_raw(info["value_preview"])}"')
