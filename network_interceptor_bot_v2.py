@@ -723,6 +723,17 @@ def _build_har(result: ScanResult) -> bytes:
     return json.dumps(har, indent=2, ensure_ascii=False).encode("utf-8")
 
 
+def _esc(text: str) -> str:
+    """Escape Markdown v1 special chars in user-controlled content.
+    Escapes: _ * ` [ ]  (the chars that break Telegram Markdown v1 entities)
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    for ch in ('\\', '_', '*', '`', '[', ']'):
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+
 def _build_summary_text(result: ScanResult) -> str:
     """Short Telegram message — under 4096 chars."""
     elapsed   = result.finished_at - result.started_at
@@ -743,19 +754,19 @@ def _build_summary_text(result: ScanResult) -> str:
     status_str = "  ".join(f"HTTP{s}: {c}" for s, c in sorted(statuses.items()))
 
     auth_flags = []
-    if any(r.has_bearer    for r in result.requests): auth_flags.append("🔑 Bearer")
-    if any(r.has_api_key   for r in result.requests): auth_flags.append("🗝 API-Key")
-    if any(r.has_csrf      for r in result.requests): auth_flags.append("🛡 CSRF")
+    if any(r.has_bearer      for r in result.requests): auth_flags.append("🔑 Bearer")
+    if any(r.has_api_key     for r in result.requests): auth_flags.append("🗝 API-Key")
+    if any(r.has_csrf        for r in result.requests): auth_flags.append("🛡 CSRF")
     if any(r.has_cookie_auth for r in result.requests): auth_flags.append("🍪 Cookie-Auth")
 
     lines = [
-        f"✅ *Scan complete*  `[{result.scan_id}]`  {elapsed:.1f}s",
-        f"📡 `{result.target_url}`",
-        f"📄 _{result.page_title}_" if result.page_title else "",
+        f"✅ *Scan complete*  `[{_esc(result.scan_id)}]`  {elapsed:.1f}s",
+        f"📡 `{_esc(result.target_url)}`",
+        f"📄 _{_esc(result.page_title)}_" if result.page_title else "",
         "",
         f"*Captured:* {len(result.requests)} API call(s)",
-        f"Methods:  {method_str or 'none'}",
-        f"Status:   {status_str or 'none'}",
+        f"Methods:  {_esc(method_str) or 'none'}",
+        f"Status:   {_esc(status_str) or 'none'}",
         f"POST with payload: {with_body}",
         f"WS frames: {len(result.ws_frames)}",
         "",
@@ -764,7 +775,7 @@ def _build_summary_text(result: ScanResult) -> str:
         lines.append("*Auth detected:*  " + "  ".join(auth_flags))
     if result.auth_tokens:
         for k, v in list(result.auth_tokens.items())[:3]:
-            lines.append(f"  `{k}`: `{v}`")
+            lines.append(f"  `{_esc(k)}`: `{_esc(str(v))}`")
     if secrets:
         lines.append(f"⚠️ *{secrets} request(s) with secrets in URL!*")
     if result.console_errors:
@@ -797,14 +808,14 @@ def _diff_scans(a: ScanResult, b: ScanResult) -> str:
 
     lines = [
         "━" * 60,
-        f"DIFF  [{a.scan_id}]  vs  [{b.scan_id}]",
-        f"A: {a.target_url}",
-        f"B: {b.target_url}",
+        f"DIFF  [{_esc(a.scan_id)}]  vs  [{_esc(b.scan_id)}]",
+        f"A: {_esc(a.target_url)}",
+        f"B: {_esc(b.target_url)}",
         "━" * 60,
         "",
         f"Common requests  : {len(common)}",
-        f"Only in A [{a.scan_id}] : {len(only_a)}",
-        f"Only in B [{b.scan_id}] : {len(only_b)}",
+        f"Only in A [{_esc(a.scan_id)}] : {len(only_a)}",
+        f"Only in B [{_esc(b.scan_id)}] : {len(only_b)}",
         f"Status changed   : {len(changed_status)}",
         "",
     ]
@@ -913,7 +924,7 @@ async def _run_scan_command(
 
     _active.add(user_id)
     status_msg = await msg.reply(
-        f"🔍 Scanning `{url}` …\n"
+        f"🔍 Scanning `{_esc(url)}` …\n"
         f"_{('Click → ' + interact_selector + ' → ') if interact_selector else ''}"
         f"waiting up to {(NAVIGATE_TIMEOUT_MS + NETWORKIDLE_TIMEOUT_MS) // 1000}s_",
         parse_mode="Markdown",
@@ -934,7 +945,7 @@ async def _run_scan_command(
 
         if not result.requests and not result.ws_frames:
             await status_msg.edit_text(
-                f"✅ Scan `[{result.scan_id}]` done — "
+                f"✅ Scan `[{_esc(result.scan_id)}]` done — "
                 f"no XHR/Fetch captured.\n"
                 f"_(Try `/scan_click` if the page needs interaction)_",
                 parse_mode="Markdown",
@@ -964,7 +975,7 @@ async def _run_scan_command(
 
     except Exception as exc:
         log.exception("Scan error")
-        await status_msg.edit_text(f"❌ Unexpected error: `{exc}`", parse_mode="Markdown")
+        await status_msg.edit_text(f"❌ Unexpected error: `{_esc(str(exc))}`", parse_mode="Markdown")
     finally:
         _active.discard(user_id)
 
@@ -1037,8 +1048,8 @@ async def cmd_scans(msg: Message) -> None:
     for r in reversed(cache):
         ts  = datetime.fromtimestamp(r.started_at, tz=timezone.utc).strftime("%H:%M:%S")
         lines.append(
-            f"`[{r.scan_id}]`  {ts} UTC  —  {len(r.requests)} req(s)  "
-            f"→  `{r.target_url[:50]}`"
+            f"`[{_esc(r.scan_id)}]`  {ts} UTC  —  {len(r.requests)} req(s)  "
+            f"→  `{_esc(r.target_url[:50])}`"
         )
     await msg.reply("\n".join(lines), parse_mode="Markdown")
 
@@ -1050,7 +1061,7 @@ async def cmd_diff(msg: Message) -> None:
     parts   = (msg.text or "").split()
     if len(parts) < 3:
         cache   = _scan_cache.get(user_id, [])
-        ids_str = "  ".join(f"`{r.scan_id}`" for r in cache[-4:]) or "_none_"
+        ids_str = "  ".join(f"`{_esc(r.scan_id)}`" for r in cache[-4:]) or "_none_"
         await msg.reply(
             f"Usage: `/diff <id1> <id2>`\n\nYour recent scan IDs: {ids_str}",
             parse_mode="Markdown",
