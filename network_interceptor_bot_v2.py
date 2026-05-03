@@ -1,20 +1,18 @@
 """
-network_interceptor_bot_v2.py
+network_interceptor_bot_v3.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Internal Telegram Bot — Advanced Network Interceptor  (v2 — Real-World)
+Internal Telegram Bot — Advanced Network Interceptor  (v3)
 Stack : aiogram 3.x  |  playwright async  |  playwright-stealth
 
-REAL-WORLD ENHANCEMENTS over v1:
-  ① Response body + status capture (not just requests)
-  ② WebSocket frame capture (ws:// / wss://)
-  ③ Auth token extraction — Bearer, API keys, cookies, CSRF
-  ④ /diff command — compare two scans side-by-side
-  ⑤ /filter command — re-filter a cached scan without re-fetching
-  ⑥ Interaction mode — click a CSS selector before capturing
-  ⑦ Scan queue — multiple users served concurrently, max 3 parallel
-  ⑧ Timeline with latency — request start → response end in ms
-  ⑨ HAR export — standard format parseable by DevTools / Insomnia
-  ⑩ Secrets detector — flag credentials leaked into GET params
+v3 IMPROVEMENTS over v2:
+  ⑪ Form structure detection — fields, types, labels → JSON block (no submit)
+  ⑫ Payment form fake-fill — card/CVV/expiry auto-filled → XHR captured
+  ⑬ JS event triggers — scroll + hover + timer wait → lazy XHR capture
+  ⑭ Payment field detection output — /payload-style JSON block in Telegram
+  ⑮ Cookie/session extraction — HttpOnly, Secure, auth cookies shown
+  ⑯ Improved auth/token detection — JWT, Bearer in responses, API keys
+  ⑰ Improved secrets detection — 20+ patterns, response body scanning
+  ⑱ Multi-phase scan engine — 5 phases, best result auto-selected
 
 Install:
     pip install aiogram playwright playwright-stealth
@@ -22,7 +20,7 @@ Install:
 
 Run:
     export BOT_TOKEN="123:ABC..."
-    python network_interceptor_bot_v2.py
+    python network_interceptor_bot_v3.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -110,10 +108,53 @@ STRIP_REQUEST_HEADERS: set[str] = {
 
 # ① Secrets in GET params — flag these to the user
 SECRET_PARAM_PATTERNS: list[re.Pattern] = [re.compile(p, re.I) for p in [
-    r"(api[_-]?key|apikey|access[_-]?token|auth[_-]?token|secret|password|passwd|pwd)"
-    r"=([^&]{4,})",
+    r"(api[_-]?key|apikey|access[_-]?token|auth[_-]?token|secret|password|passwd|pwd)=([^&]{4,})",
     r"(bearer|token)=([^&]{8,})",
+    r"(private[_-]?key|client[_-]?secret|app[_-]?secret)=([^&]{4,})",
+    r"(jwt|id[_-]?token|refresh[_-]?token)=([^&]{8,})",
 ]]
+
+# ⑰ Secrets in response bodies
+SECRET_BODY_PATTERNS: list[re.Pattern] = [re.compile(p, re.I) for p in [
+    r'"(access_token|accessToken|auth_token|authToken|id_token|idToken)"\s*:\s*"([^"]{10,})"',
+    r'"(api_key|apiKey|api_secret|apiSecret|client_secret|clientSecret)"\s*:\s*"([^"]{8,})"',
+    r'"(password|passwd|pwd|secret)"\s*:\s*"([^"]{4,})"',
+    r'(sk_live|pk_live|sk_test|pk_test)_[A-Za-z0-9]{20,}',  # Stripe keys
+    r'ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}',  # JWT
+]]
+
+# ⑫ Fake card data for payment form fill
+FAKE_CARD_DATA = {
+    "number":  "4111111111111111",   # Visa test number
+    "expiry_month": "12",
+    "expiry_year":  "2028",
+    "expiry_mmyy":  "12/28",
+    "cvv":     "123",
+    "name":    "John Doe",
+    "email":   "test@example.com",
+    "phone":   "5555555555",
+    "zip":     "10001",
+    "address": "123 Test St",
+    "city":    "New York",
+    "state":   "NY",
+    "country": "US",
+}
+
+# ⑪ Field name → category mapping for form structure detection
+_CARD_FIELD_RE = re.compile(
+    r"card.?num|cardnumber|cc.?num|pan$|account.?num|acctnum|number$|"
+    r"cvv|cvc|csc|security.?code|card.?code|cvv2|"
+    r"exp.?date|expiry|exp.?month|exp.?year|expirationdate|"
+    r"card.?holder|cardholder|name.?on.?card|"
+    r"routing.?num|routingnumber",
+    re.I
+)
+_BILLING_FIELD_RE = re.compile(
+    r"bill|address|city|state|zip|postal|country|province", re.I
+)
+_AUTH_FIELD_RE = re.compile(
+    r"email|phone|username|user.?name|login|password|passwd", re.I
+)
 
 # ════════════════════════════════════════════════════════════════════════════
 # DATA MODELS
@@ -278,7 +319,13 @@ class ScanResult:
     ws_frames: List[WsFrame] = field(default_factory=list)
     page_title: str = ""
     console_errors: List[str] = field(default_factory=list)
-    auth_tokens: Dict[str, str] = field(default_factory=dict)  # ③ extracted tokens
+    auth_tokens: Dict[str, str] = field(default_factory=dict)   # ③ extracted tokens
+    # ⑪ Form structure detection
+    forms_detected: List[dict] = field(default_factory=list)
+    # ⑮ Cookie/session info
+    session_cookies: List[dict] = field(default_factory=list)
+    # ⑰ Secrets found in response bodies
+    body_secrets: List[dict] = field(default_factory=list)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -378,23 +425,262 @@ def _detect_secrets_in_url(url: str) -> list[str]:
 
 
 def _extract_auth_tokens(requests: List[CapturedRequest]) -> Dict[str, str]:
-    """③ Walk all requests and pull out unique auth tokens / keys."""
+    """⑯ Walk all requests AND responses — pull out unique auth tokens / keys."""
     tokens: Dict[str, str] = {}
     for req in requests:
+        # Request headers
         for k, v in req.req_headers.items():
             kl = k.lower()
             if kl == "authorization":
                 tokens["Authorization"] = _mask(k, v)
-            elif kl in ("x-api-key", "x-auth-token", "x-access-token"):
+            elif kl in ("x-api-key", "x-auth-token", "x-access-token",
+                        "x-client-token", "x-session-token"):
                 tokens[k] = _mask(k, v)
-            elif kl == "x-csrf-token" or kl == "x-xsrf-token":
-                tokens[k] = v
+            elif kl in ("x-csrf-token", "x-xsrf-token", "x-request-token"):
+                tokens[k] = v[:40] + ("…" if len(v) > 40 else "")
+        # Response headers — auth challenges / token issuance
+        for k, v in req.resp_headers.items():
+            kl = k.lower()
+            if kl in ("www-authenticate", "x-auth-token", "x-access-token"):
+                tokens[f"resp:{k}"] = v[:60]
+        # Response body — JWT / token fields
+        if req.resp_body:
+            for pat in SECRET_BODY_PATTERNS:
+                for m in pat.finditer(req.resp_body):
+                    key = m.group(1) if m.lastindex and m.lastindex >= 1 else "token"
+                    val = m.group(0)[:60]
+                    tokens[f"body:{key}"] = val
     return tokens
+
+
+def _scan_body_secrets(requests: List[CapturedRequest]) -> List[dict]:
+    """⑰ Scan response bodies for leaked secrets / credentials."""
+    found = []
+    for req in requests:
+        if not req.resp_body:
+            continue
+        for pat in SECRET_BODY_PATTERNS:
+            for m in pat.finditer(req.resp_body):
+                found.append({
+                    "url":     req.url[:80],
+                    "pattern": pat.pattern[:40],
+                    "match":   m.group(0)[:80],
+                })
+    return found
+
+
+def _categorize_field(name: str, ftype: str, label: str) -> str:
+    """⑪ Categorize a form field for structure map."""
+    combined = f"{name} {label}".strip()
+    if _CARD_FIELD_RE.search(combined) or ftype in ("tel", "credit-card"):
+        return "card"
+    if _BILLING_FIELD_RE.search(combined):
+        return "billing"
+    if _AUTH_FIELD_RE.search(combined) or ftype in ("email", "password", "tel"):
+        return "user"
+    if ftype == "hidden":
+        return "hidden"
+    return "other"
 
 
 def _short_id(url: str, ts: float) -> str:
     import hashlib
     return hashlib.md5(f"{url}{ts}".encode()).hexdigest()[:6].upper()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ⑪ FORM STRUCTURE DETECTION
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _detect_forms(page) -> List[dict]:
+    """Extract all forms from the page DOM — structure only, no submission."""
+    try:
+        forms = await page.evaluate("""() => {
+            const results = [];
+            document.querySelectorAll('form').forEach((form, fi) => {
+                const fields = [];
+                form.querySelectorAll('input, select, textarea').forEach(el => {
+                    const label = (() => {
+                        if (el.labels && el.labels.length)
+                            return el.labels[0].innerText.trim();
+                        const lbl = document.querySelector(`label[for="${el.id}"]`);
+                        return lbl ? lbl.innerText.trim() : (el.placeholder || '');
+                    })();
+                    fields.push({
+                        name:        el.name || el.id || '',
+                        type:        el.type || el.tagName.toLowerCase(),
+                        label:       label.slice(0, 60),
+                        required:    el.required,
+                        value:       (el.type === 'hidden') ? (el.value || '') : '',
+                        autocomplete: el.autocomplete || '',
+                    });
+                });
+                const btns = [];
+                form.querySelectorAll('button, input[type=submit], input[type=button]')
+                    .forEach(b => btns.push(b.innerText?.trim() || b.value || 'Submit'));
+                results.push({
+                    form_idx: fi + 1,
+                    action:   form.action || '',
+                    method:   (form.method || 'GET').toUpperCase(),
+                    id:       form.id || '',
+                    fields:   fields,
+                    buttons:  btns.slice(0, 3),
+                });
+            });
+            return results;
+        }""")
+        return forms or []
+    except Exception:
+        return []
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ⑬ JS EVENT TRIGGERS  (scroll + hover + timer flush)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _trigger_js_events(page) -> None:
+    """Trigger scroll, hover, and wait for deferred timers to fire lazy XHR."""
+    try:
+        # Scroll down incrementally — triggers infinite scroll / lazy load XHR
+        await page.evaluate("""async () => {
+            const step = Math.floor(window.innerHeight * 0.8);
+            const max  = Math.min(document.body.scrollHeight, step * 8);
+            for (let y = 0; y < max; y += step) {
+                window.scrollTo(0, y);
+                await new Promise(r => setTimeout(r, 300));
+            }
+            window.scrollTo(0, 0);
+        }""")
+        # Hover over common interactive elements
+        for sel in ("button", "a.nav-link", ".menu-item", "[data-trigger]"):
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.hover()
+                    await asyncio.sleep(0.2)
+            except Exception:
+                pass
+        # Extra wait for setTimeout / setInterval callbacks
+        await asyncio.sleep(2.5)
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ⑫ PAYMENT FORM FAKE-FILL ENGINE
+# ════════════════════════════════════════════════════════════════════════════
+
+_CARD_SELECTORS = [
+    # Card number
+    ("card_number", [
+        "input[name*=cardNum]", "input[name*=cardNumber]", "input[name*=number]",
+        "input[name*=cc_num]",  "input[name*=ccnum]",      "input[name*=pan]",
+        "input[autocomplete=cc-number]", "input[id*=card-number]",
+        "input[id*=cardNumber]", "input[placeholder*=card]",
+    ]),
+    ("expiry_month", [
+        "select[name*=expirationDateMonth]", "select[name*=expMonth]",
+        "input[name*=exp_month]", "input[name*=expMonth]",
+        "input[autocomplete=cc-exp-month]",
+    ]),
+    ("expiry_year", [
+        "select[name*=expirationDateYear]", "select[name*=expYear]",
+        "input[name*=exp_year]",  "input[name*=expYear]",
+        "input[autocomplete=cc-exp-year]",
+    ]),
+    ("expiry_mmyy", [
+        "input[name*=expiry]", "input[name*=expDate]", "input[name*=exp_date]",
+        "input[autocomplete=cc-exp]", "input[placeholder*=MM/YY]",
+        "input[placeholder*=MM/YYYY]",
+    ]),
+    ("cvv", [
+        "input[name*=cvv]",  "input[name*=cvc]",  "input[name*=csc]",
+        "input[name*=CVV2]", "input[name*=cvv2]", "input[name*=securityCode]",
+        "input[autocomplete=cc-csc]", "input[placeholder*=CVV]",
+        "input[placeholder*=CVC]",
+    ]),
+    ("name", [
+        "input[name*=cardHolder]", "input[name*=card_holder]",
+        "input[name*=nameOnCard]", "input[autocomplete=cc-name]",
+    ]),
+    ("email", [
+        "input[type=email]", "input[name*=email]", "input[id*=email]",
+    ]),
+    ("zip", [
+        "input[name*=billZip]", "input[name*=billing_zip]", "input[name*=zipCode]",
+        "input[name*=postalCode]", "input[autocomplete=postal-code]",
+    ]),
+]
+
+
+async def _fill_payment_form(page) -> dict:
+    """
+    ⑫ Detect and fill payment form fields with fake card data.
+    Returns a report of which fields were filled.
+    Does NOT click submit.
+    """
+    filled = {}
+    for field_key, selectors in _CARD_SELECTORS:
+        value = FAKE_CARD_DATA.get(field_key, "")
+        for sel in selectors:
+            try:
+                el = await page.query_selector(sel)
+                if not el:
+                    continue
+                tag  = await el.evaluate("e => e.tagName.toLowerCase()")
+                typ  = await el.evaluate("e => (e.type || '').toLowerCase()")
+                name = await el.evaluate("e => e.name || e.id || ''")
+                if tag == "select":
+                    # Pick the option whose value/text best matches
+                    await el.evaluate(f"""
+                        e => {{
+                            const v = '{value}';
+                            const opt = Array.from(e.options).find(
+                                o => o.value === v || o.text.includes(v)
+                            );
+                            if (opt) e.value = opt.value;
+                        }}
+                    """)
+                else:
+                    await el.triple_click()
+                    await el.type(value, delay=30)
+                filled[name or sel] = {"field": field_key, "selector": sel, "value_preview": value[:6] + "***"}
+                break   # found + filled for this field_key — move on
+            except Exception:
+                continue
+    return filled
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ⑮ COOKIE / SESSION EXTRACTION
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _extract_session_cookies(context) -> List[dict]:
+    """⑮ Get all cookies from the browser context, flag auth-relevant ones."""
+    _AUTH_COOKIE_RE = re.compile(
+        r"(session|sess|auth|jwt|token|sid|login|user|account|remember)", re.I
+    )
+    try:
+        raw_cookies = await context.cookies()
+    except Exception:
+        return []
+    result = []
+    for ck in raw_cookies:
+        name  = ck.get("name", "")
+        value = ck.get("value", "")
+        is_auth = bool(_AUTH_COOKIE_RE.search(name))
+        result.append({
+            "name":      name,
+            "value":     (value[:12] + "…") if len(value) > 12 else value,
+            "domain":    ck.get("domain", ""),
+            "httpOnly":  ck.get("httpOnly", False),
+            "secure":    ck.get("secure",   False),
+            "sameSite":  ck.get("sameSite", ""),
+            "is_auth":   is_auth,
+        })
+    # Sort: auth cookies first
+    result.sort(key=lambda c: (not c["is_auth"], c["name"]))
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -597,6 +883,9 @@ async def scan_url(
                 except Exception as exc:
                     log.warning("Interaction failed (%s): %s", interact_selector, exc)
 
+            # ── ⑬ JS event triggers — scroll + hover + lazy XHR ─────────
+            await _trigger_js_events(page)
+
             # ── Wait for network quiet ────────────────────────────────
             try:
                 await page.wait_for_load_state("networkidle",
@@ -606,6 +895,31 @@ async def scan_url(
 
             # ── Extra dwell — catch lazy deferred calls ───────────────
             await asyncio.sleep(EXTRA_WAIT_S)
+
+            # ── ⑪ Form structure detection ───────────────────────────
+            result.forms_detected = await _detect_forms(page)
+
+            # ── ⑫ Payment form fake-fill (if payment form detected) ──
+            has_payment_form = any(
+                any(_CARD_FIELD_RE.search(f.get("name","") + f.get("label",""))
+                    for f in frm.get("fields", []))
+                for frm in result.forms_detected
+            )
+            if has_payment_form:
+                fill_report = await _fill_payment_form(page)
+                result.forms_detected.append({
+                    "_payment_fill": fill_report,
+                    "note": "Fake card data filled — XHR captured after fill"
+                })
+                # Wait for any XHR triggered by autofill / validation
+                await asyncio.sleep(2.0)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8_000)
+                except Exception:
+                    pass
+
+            # ── ⑮ Cookie/session extraction ──────────────────────────
+            result.session_cookies = await _extract_session_cookies(context)
 
             # Flush any still-pending requests (no response matched)
             async with lock:
@@ -628,8 +942,10 @@ async def scan_url(
     for i, req in enumerate(result.requests, start=1):
         req.uid = i
 
-    # ③ Extract auth tokens summary
-    result.auth_tokens = _extract_auth_tokens(result.requests)
+    # ⑯ Extract auth tokens (requests + response bodies)
+    result.auth_tokens  = _extract_auth_tokens(result.requests)
+    # ⑰ Scan response bodies for leaked secrets
+    result.body_secrets = _scan_body_secrets(result.requests)
 
     result.finished_at = time.time()
     return result, None
@@ -755,34 +1071,123 @@ def _build_summary_text(result: ScanResult) -> str:
 
     auth_flags = []
     if any(r.has_bearer      for r in result.requests): auth_flags.append("🔑 Bearer")
-    if any(r.has_api_key     for r in result.requests): auth_flags.append("🗝 API-Key")
+    if any(r.has_api_key     for r in result.requests): auth_flags.append("🗝 API\\-Key")
     if any(r.has_csrf        for r in result.requests): auth_flags.append("🛡 CSRF")
-    if any(r.has_cookie_auth for r in result.requests): auth_flags.append("🍪 Cookie-Auth")
+    if any(r.has_cookie_auth for r in result.requests): auth_flags.append("🍪 Cookie\\-Auth")
 
     lines = [
         f"✅ *Scan complete*  `[{_esc(result.scan_id)}]`  {elapsed:.1f}s",
         f"📡 `{_esc(result.target_url)}`",
         f"📄 _{_esc(result.page_title)}_" if result.page_title else "",
         "",
-        f"*Captured:* {len(result.requests)} API call(s)",
-        f"Methods:  {_esc(method_str) or 'none'}",
-        f"Status:   {_esc(status_str) or 'none'}",
-        f"POST with payload: {with_body}",
-        f"WS frames: {len(result.ws_frames)}",
-        "",
+        f"*Captured:* {len(result.requests)} API call(s)  |  WS frames: {len(result.ws_frames)}",
+        f"Methods : {_esc(method_str) or 'none'}",
+        f"Status  : {_esc(status_str) or 'none'}",
+        f"POST/payload: {with_body}",
     ]
+
+    # ── ⑯ Auth tokens ─────────────────────────────────────────────────────
     if auth_flags:
-        lines.append("*Auth detected:*  " + "  ".join(auth_flags))
+        lines.append("")
+        lines.append("*🔐 Auth detected:*  " + "  ".join(auth_flags))
     if result.auth_tokens:
-        for k, v in list(result.auth_tokens.items())[:3]:
-            lines.append(f"  `{_esc(k)}`: `{_esc(str(v))}`")
+        for k, v in list(result.auth_tokens.items())[:5]:
+            lines.append(f"  `{_esc(k)}`: `{_esc(str(v)[:60])}`")
+
+    # ── ⑰ Body secrets ────────────────────────────────────────────────────
+    if result.body_secrets:
+        lines.append("")
+        lines.append(f"⚠️ *{len(result.body_secrets)} secret(s) found in response bodies:*")
+        for s in result.body_secrets[:4]:
+            lines.append(f"  `{_esc(s['url'][:50])}` → `{_esc(s['match'][:50])}`")
+
     if secrets:
-        lines.append(f"⚠️ *{secrets} request(s) with secrets in URL!*")
+        lines.append(f"⚠️ *{secrets} request(s) with secrets in URL\\!*")
+
+    # ── ⑮ Session cookies ─────────────────────────────────────────────────
+    auth_cookies = [c for c in result.session_cookies if c.get("is_auth")]
+    if auth_cookies:
+        lines.append("")
+        lines.append(f"🍪 *Session Cookies* ({len(result.session_cookies)} total, "
+                     f"{len(auth_cookies)} auth):*")
+        lines.append("```")
+        for ck in auth_cookies[:6]:
+            flags = ""
+            if ck["httpOnly"]: flags += " HttpOnly"
+            if ck["secure"]:   flags += " Secure"
+            if ck["sameSite"]: flags += f" SameSite={ck['sameSite']}"
+            lines.append(f'  "{ck["name"]}": "{ck["value"]}"{flags}')
+        lines.append("```")
+
+    # ── ⑪ Form structure map ──────────────────────────────────────────────
+    real_forms = [f for f in result.forms_detected if "form_idx" in f]
+    fill_report = next((f.get("_payment_fill") for f in result.forms_detected
+                        if "_payment_fill" in f), None)
+    if real_forms:
+        lines.append("")
+        lines.append(f"📋 *Form Structure* ({len(real_forms)} form(s) detected):")
+        for frm in real_forms[:4]:
+            lines.append(f"\n*Form {frm['form_idx']}* — `{_esc(frm['action'][:60] or '(no action)')}` "
+                         f"[{frm['method']}]")
+            # Categorize fields
+            card_f    = [f for f in frm["fields"] if _categorize_field(f["name"], f["type"], f["label"]) == "card"]
+            billing_f = [f for f in frm["fields"] if _categorize_field(f["name"], f["type"], f["label"]) == "billing"]
+            user_f    = [f for f in frm["fields"] if _categorize_field(f["name"], f["type"], f["label"]) == "user"]
+            hidden_f  = [f for f in frm["fields"] if f["type"] == "hidden"]
+            other_f   = [f for f in frm["fields"]
+                         if _categorize_field(f["name"], f["type"], f["label"])
+                         not in ("card", "billing", "user", "hidden")]
+
+            def _jblock(fields, max_f=10):
+                if not fields:
+                    return None
+                rows = ["{"]
+                for f in fields[:max_f]:
+                    label = f.get("label") or f["name"]
+                    req   = " // required" if f.get("required") else ""
+                    rows.append(f'  "{_esc_raw(f["name"])}": "{_esc_raw(label)}",{req}')
+                rows.append("}")
+                return "```\n" + "\n".join(rows) + "\n```"
+
+            if card_f:
+                lines.append(f"💳 *Card Fields* ({len(card_f)}):")
+                lines.append(_jblock(card_f))
+            if billing_f:
+                lines.append(f"💰 *Billing Fields* ({len(billing_f)}):")
+                lines.append(_jblock(billing_f))
+            if user_f:
+                lines.append(f"✏️ *User Fields* ({len(user_f)}):")
+                lines.append(_jblock(user_f))
+            if hidden_f:
+                hnames = ", ".join(f"`{_esc(f['name'][:22])}`" for f in hidden_f[:8])
+                extra  = f" +{len(hidden_f)-8}" if len(hidden_f) > 8 else ""
+                lines.append(f"📌 *Hidden* ({len(hidden_f)}): {hnames}{_esc(extra)}")
+            if other_f:
+                lines.append(f"📝 *Other* ({len(other_f)}): "
+                             + ", ".join(f"`{_esc(f['name'][:20])}`" for f in other_f[:5]))
+            if frm.get("buttons"):
+                btns = " · ".join(f"`{_esc(b[:30])}`" for b in frm["buttons"])
+                lines.append(f"🟢 *Submit*: {btns}")
+
+    # ── ⑫ Payment fill report ─────────────────────────────────────────────
+    if fill_report:
+        lines.append("")
+        lines.append(f"⚡ *Payment Form Auto\\-Fill:* {len(fill_report)} field(s) filled with fake card data")
+        lines.append("```")
+        for fname, info in list(fill_report.items())[:8]:
+            lines.append(f'  "{_esc_raw(fname)}": "{_esc_raw(info["value_preview"])}"')
+        lines.append("```")
+
     if result.console_errors:
-        lines.append(f"⚠️ {len(result.console_errors)} console error(s)")
+        lines.append(f"\n⚠️ {len(result.console_errors)} console error(s)")
 
     lines += ["", "📎 Files attached below"]
     return "\n".join(l for l in lines if l is not None)
+
+
+def _esc_raw(s: str) -> str:
+    """Escape for use inside code block (no Markdown escaping needed, just truncate)."""
+    return str(s)[:60].replace('"', "'")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -929,15 +1334,17 @@ AUTO_CLICK_SELECTORS: list[str] = [
 async def _run_full_scan(
     msg: Message,
     target_url: str,
-    extra_selector: Optional[str] = None,   # user-supplied via /scan <url> #selector
+    extra_selector: Optional[str] = None,
     filter_domain: Optional[str]  = None,
 ) -> None:
     """
-    Runs ALL scan modes automatically:
-      Phase 1 — Base scan (no interaction)
-      Phase 2 — Re-scan with each auto-click selector (stops on first that yields new requests)
-      Phase 3 — Re-scan with user-supplied selector if given
-    Sends: summary message + .txt log + .har file + diff (if click phase found new requests)
+    Runs ALL scan phases automatically:
+      Phase 1 — Base XHR/Fetch + JS event triggers (scroll/hover/timers)
+      Phase 2 — Form structure detection + payment fake-fill (built into scan_url)
+      Phase 3 — Cookie/session extraction (built into scan_url)
+      Phase 4 — Auto-click 15+ common selectors (stops on first new traffic)
+      Phase 5 — User-supplied selector (if given)
+    Sends: summary + .txt log + .har + diff (if click found new requests)
     """
     user_id = msg.from_user.id
 
@@ -955,8 +1362,8 @@ async def _run_full_scan(
     ts_str = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     status_msg = await msg.reply(
-        f"🔬 *Full Scan* — `{_esc(url)}`\n"
-        f"_Phase 1/3: Base XHR/Fetch capture …_",
+        f"🔬 *Full Scan v3* — `{_esc(url)}`\n"
+        f"_Phase 1/5: Base XHR/Fetch + JS event triggers …_",
         parse_mode="Markdown",
     )
 
@@ -971,12 +1378,21 @@ async def _run_full_scan(
         _cache_result(user_id, result_base)
         base_urls = {r.url for r in result_base.requests}
 
-        # ── Phase 2: Auto-click scan ──────────────────────────────────────
+        # ── Phase 2-3: Form detection + payment fill (done inside scan_url) ─
+        forms_found = len([f for f in result_base.forms_detected if "form_idx" in f])
+        pay_filled  = any("_payment_fill" in f for f in result_base.forms_detected)
+        cookies_found = len(result_base.session_cookies)
+
         await status_msg.edit_text(
-            f"🔬 *Full Scan* — `{_esc(url)}`\n"
-            f"_Phase 2/3: Trying {len(AUTO_CLICK_SELECTORS)} click selectors …_",
+            f"🔬 *Full Scan v3* — `{_esc(url)}`\n"
+            f"_Phase 2-3 done: {forms_found} form(s) detected"
+            f"{', payment filled' if pay_filled else ''}"
+            f", {cookies_found} cookie(s)_\n"
+            f"_Phase 4/5: Auto-click {len(AUTO_CLICK_SELECTORS)} selectors …_",
             parse_mode="Markdown",
         )
+
+        # ── Phase 4: Auto-click scan ──────────────────────────────────────
 
         result_click: Optional[ScanResult] = None
         clicked_selector: Optional[str]    = None
@@ -993,12 +1409,12 @@ async def _run_full_scan(
                 log.info("Auto-click hit: %s → %d new request(s)", sel, len(new_urls))
                 break
 
-        # ── Phase 3: User-supplied selector ──────────────────────────────
+        # ── Phase 5: User-supplied selector ──────────────────────────────
         result_user: Optional[ScanResult] = None
         if extra_selector:
             await status_msg.edit_text(
-                f"🔬 *Full Scan* — `{_esc(url)}`\n"
-                f"_Phase 3/3: Custom click `{_esc(extra_selector)}` …_",
+                f"🔬 *Full Scan v3* — `{_esc(url)}`\n"
+                f"_Phase 5/5: Custom click `{_esc(extra_selector)}` …_",
                 parse_mode="Markdown",
             )
             r3, e3 = await scan_url(url, interact_selector=extra_selector,
