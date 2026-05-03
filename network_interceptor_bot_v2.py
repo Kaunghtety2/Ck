@@ -885,32 +885,60 @@ async def cmd_help(msg: Message) -> None:
     text = (
         "🔬 *Network Interceptor Bot v2*\n\n"
         "*Commands*\n"
-        "`/scan <url>` — Intercept XHR/Fetch\\+responses\n"
-        "`/scan_har <url>` — Same \\+ download HAR file\n"
-        "`/scan_click <url> <css_selector>` — Click before capture\n"
-        "`/scan_filter <url> <domain>` — Only capture that domain\n"
+        "`/scan <url>` — Full auto scan \\(all modes\\)\n"
+        "`/scan <url> #selector` — \\+ custom click selector\n"
+        "`/scan <url> filter:domain` — \\+ domain filter\n"
         "`/diff <id1> <id2>` — Diff two scans\n"
         "`/scans` — List your recent scans\n"
         "`/help` — This message\n\n"
-        "*Output*\n"
-        "Each scan delivers a `.txt` log \\+ `.har` file\\.\n"
-        "HAR files open in Chrome DevTools / Insomnia\\.\n\n"
-        "*Example*\n"
-        "`/scan https://app.internal/checkout`\n"
-        "`/scan_click https://app.internal #pay-button`\n"
-        "`/scan_filter https://app.internal api.internal`"
+        "*What /scan does automatically:*\n"
+        "① Base XHR/Fetch \\+ response capture\n"
+        "② WebSocket frame capture\n"
+        "③ Auth token extraction\n"
+        "④ Auto\\-click 15\\+ common selectors\n"
+        "⑤ Secrets detector in URLs\n"
+        "⑥ HAR export \\(Chrome DevTools / Insomnia\\)\n"
+        "⑦ Diff \\(base vs click\\) if new traffic found\n\n"
+        "*Output per scan:*\n"
+        "• Summary message\n"
+        "• `.txt` human\\-readable log\n"
+        "• `.har` file\n"
+        "• `.txt` diff \\(if auto\\-click found new requests\\)\n\n"
+        "*Examples*\n"
+        "`/scan https://app\\.internal/checkout`\n"
+        "`/scan https://app\\.internal #pay\\-button`\n"
+        "`/scan https://app\\.internal filter:api\\.internal`"
     )
     await msg.answer(text, parse_mode="MarkdownV2")
 
 
-async def _run_scan_command(
+# ── Auto-click selectors tried on every scan ────────────────────────────────
+AUTO_CLICK_SELECTORS: list[str] = [
+    # Payment / checkout buttons
+    "button[type=submit]", "input[type=submit]",
+    "#pay-button", "#submit-btn", "#checkout-btn", ".pay-now",
+    ".checkout-button", ".submit-payment", ".place-order",
+    "[data-testid*=pay]", "[data-testid*=submit]", "[data-testid*=checkout]",
+    # Login / auth
+    "#login-btn", ".login-button", "[type=submit]",
+    # Generic
+    "button.primary", "button.btn-primary", ".cta-button",
+]
+
+
+async def _run_full_scan(
     msg: Message,
     target_url: str,
-    interact_selector: Optional[str] = None,
-    filter_domain: Optional[str]     = None,
-    send_har: bool                   = True,
+    extra_selector: Optional[str] = None,   # user-supplied via /scan <url> #selector
+    filter_domain: Optional[str]  = None,
 ) -> None:
-    """Core handler used by all /scan* commands."""
+    """
+    Runs ALL scan modes automatically:
+      Phase 1 — Base scan (no interaction)
+      Phase 2 — Re-scan with each auto-click selector (stops on first that yields new requests)
+      Phase 3 — Re-scan with user-supplied selector if given
+    Sends: summary message + .txt log + .har file + diff (if click phase found new requests)
+    """
     user_id = msg.from_user.id
 
     url = _validate_url(target_url)
@@ -923,116 +951,182 @@ async def _run_scan_command(
         return
 
     _active.add(user_id)
+    domain = urlparse(url).netloc.replace(":", "_") or "scan"
+    ts_str = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+
     status_msg = await msg.reply(
-        f"🔍 Scanning `{_esc(url)}` …\n"
-        f"_{('Click → ' + interact_selector + ' → ') if interact_selector else ''}"
-        f"waiting up to {(NAVIGATE_TIMEOUT_MS + NETWORKIDLE_TIMEOUT_MS) // 1000}s_",
+        f"🔬 *Full Scan* — `{_esc(url)}`\n"
+        f"_Phase 1/3: Base XHR/Fetch capture …_",
         parse_mode="Markdown",
     )
 
     try:
-        result, error = await scan_url(
-            url,
-            interact_selector = interact_selector,
-            filter_domain     = filter_domain,
-        )
-
-        if error:
-            await status_msg.edit_text(f"❌ {error}")
+        # ── Phase 1: Base scan ────────────────────────────────────────────
+        result_base, err = await scan_url(url, filter_domain=filter_domain)
+        if err:
+            await status_msg.edit_text(f"❌ Navigation failed: `{_esc(err)}`",
+                                       parse_mode="Markdown")
             return
 
-        _cache_result(user_id, result)
+        _cache_result(user_id, result_base)
+        base_urls = {r.url for r in result_base.requests}
 
-        if not result.requests and not result.ws_frames:
+        # ── Phase 2: Auto-click scan ──────────────────────────────────────
+        await status_msg.edit_text(
+            f"🔬 *Full Scan* — `{_esc(url)}`\n"
+            f"_Phase 2/3: Trying {len(AUTO_CLICK_SELECTORS)} click selectors …_",
+            parse_mode="Markdown",
+        )
+
+        result_click: Optional[ScanResult] = None
+        clicked_selector: Optional[str]    = None
+
+        for sel in AUTO_CLICK_SELECTORS:
+            r, e = await scan_url(url, interact_selector=sel, filter_domain=filter_domain)
+            if e:
+                continue
+            new_urls = {req.url for req in r.requests} - base_urls
+            if new_urls:
+                result_click    = r
+                clicked_selector = sel
+                _cache_result(user_id, r)
+                log.info("Auto-click hit: %s → %d new request(s)", sel, len(new_urls))
+                break
+
+        # ── Phase 3: User-supplied selector ──────────────────────────────
+        result_user: Optional[ScanResult] = None
+        if extra_selector:
             await status_msg.edit_text(
-                f"✅ Scan `[{_esc(result.scan_id)}]` done — "
-                f"no XHR/Fetch captured.\n"
-                f"_(Try `/scan_click` if the page needs interaction)_",
+                f"🔬 *Full Scan* — `{_esc(url)}`\n"
+                f"_Phase 3/3: Custom click `{_esc(extra_selector)}` …_",
                 parse_mode="Markdown",
             )
-            return
+            r3, e3 = await scan_url(url, interact_selector=extra_selector,
+                                    filter_domain=filter_domain)
+            if not e3:
+                result_user = r3
+                _cache_result(user_id, r3)
 
-        # Build files
-        txt_bytes = _build_text_log(result)
-        har_bytes = _build_har(result)
-        ts        = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-        domain    = urlparse(url).netloc.replace(":", "_") or "scan"
-        txt_name  = f"scan_{domain}_{result.scan_id}_{ts}.txt"
-        har_name  = f"scan_{domain}_{result.scan_id}_{ts}.har"
+        # ── Pick best result for primary report ───────────────────────────
+        # Priority: user selector > auto-click > base
+        primary = result_user or result_click or result_base
 
-        summary = _build_summary_text(result)
-        await status_msg.edit_text(summary, parse_mode="Markdown")
+        # ── Build files ───────────────────────────────────────────────────
+        txt_bytes = _build_text_log(primary)
+        har_bytes = _build_har(primary)
+        txt_name  = f"scan_{domain}_{primary.scan_id}_{ts_str}.txt"
+        har_name  = f"scan_{domain}_{primary.scan_id}_{ts_str}.har"
 
+        # ── Build summary ─────────────────────────────────────────────────
+        elapsed_total = time.time() - result_base.started_at
+        extra_lines = []
+        if clicked_selector:
+            new_count = len({r.url for r in result_click.requests} - base_urls)
+            extra_lines.append(
+                f"🖱 Auto-click `{_esc(clicked_selector)}` → *+{new_count} new request(s)*"
+            )
+        if result_user:
+            extra_lines.append(
+                f"🖱 Custom `{_esc(extra_selector)}` → "
+                f"*{len(result_user.requests)} request(s)*"
+            )
+        if not clicked_selector and not result_user:
+            extra_lines.append("🖱 No interaction triggered new requests")
+
+        base_summary = _build_summary_text(primary)
+        full_summary = (
+            base_summary.replace(
+                "📎 Files attached below",
+                "\n".join(extra_lines) + "\n\n"
+                f"⏱ Total scan time: {elapsed_total:.1f}s\n"
+                "📎 Files attached below"
+            )
+        )
+        await status_msg.edit_text(full_summary, parse_mode="Markdown")
+
+        # ── Send files ────────────────────────────────────────────────────
         await msg.answer_document(
             BufferedInputFile(txt_bytes, filename=txt_name),
-            caption="📄 Human-readable scan log",
+            caption="📄 Scan log (best result)",
         )
-        if send_har:
+        await msg.answer_document(
+            BufferedInputFile(har_bytes, filename=har_name),
+            caption="📦 HAR — Chrome DevTools / Insomnia",
+        )
+
+        # ── Send diff if click phase found new traffic ─────────────────────
+        if result_click and result_click is not primary:
+            diff_text  = _diff_scans(result_base, result_click)
+            diff_bytes = diff_text.encode("utf-8")
             await msg.answer_document(
-                BufferedInputFile(har_bytes, filename=har_name),
-                caption="📦 HAR file — open in Chrome DevTools or Insomnia",
+                BufferedInputFile(diff_bytes,
+                                  filename=f"diff_base_vs_click_{ts_str}.txt"),
+                caption=f"④ Diff: base vs auto-click `{_esc(clicked_selector)}`",
+            )
+
+        # Edge case: nothing captured at all
+        if not primary.requests and not primary.ws_frames:
+            await status_msg.edit_text(
+                f"✅ Scan done `[{_esc(primary.scan_id)}]` — no XHR/Fetch captured.\n"
+                f"_The page may need JavaScript interaction or login._",
+                parse_mode="Markdown",
             )
 
     except Exception as exc:
-        log.exception("Scan error")
-        await status_msg.edit_text(f"❌ Unexpected error: `{_esc(str(exc))}`", parse_mode="Markdown")
+        log.exception("Full scan error")
+        await status_msg.edit_text(
+            f"❌ Unexpected error: `{_esc(str(exc))}`", parse_mode="Markdown"
+        )
     finally:
         _active.discard(user_id)
 
 
-@dp.message(Command("scan"))
+@dp.message(Command("scan", "scan_har", "scan_click", "scan_filter"))
 async def cmd_scan(msg: Message) -> None:
-    """/scan <url>"""
-    parts = (msg.text or "").split(maxsplit=1)
+    """
+    /scan <url> [css_selector] [filter:domain]
+    Runs ALL phases automatically:
+      • Base XHR/Fetch capture
+      • Auto-click 15+ common selectors
+      • Custom selector if provided
+    Returns: summary + .txt log + .har + diff (if click found new traffic)
+    """
+    parts = (msg.text or "").split(maxsplit=3)
     if len(parts) < 2:
-        await msg.reply("Usage: `/scan https://your-app.com`", parse_mode="Markdown")
-        return
-    await _run_scan_command(msg, target_url=parts[1].strip())
-
-
-@dp.message(Command("scan_har"))
-async def cmd_scan_har(msg: Message) -> None:
-    """/scan_har <url>  — same as /scan but explicitly mentions HAR"""
-    parts = (msg.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await msg.reply("Usage: `/scan_har https://your-app.com`", parse_mode="Markdown")
-        return
-    await _run_scan_command(msg, target_url=parts[1].strip(), send_har=True)
-
-
-@dp.message(Command("scan_click"))
-async def cmd_scan_click(msg: Message) -> None:
-    """⑥ /scan_click <url> <css_selector>"""
-    parts = (msg.text or "").split(maxsplit=2)
-    if len(parts) < 3:
         await msg.reply(
-            "Usage: `/scan_click https://app.com #submit-btn`\n"
-            "The bot will click the selector before capturing.",
+            "📌 *Usage:* `/scan <url> [#selector] [filter:domain]`\n\n"
+            "*Examples:*\n"
+            "`/scan https://app.com`  — full auto scan\n"
+            "`/scan https://app.com #pay-btn`  — + click selector\n"
+            "`/scan https://app.com filter:api.app.com`  — domain filter\n\n"
+            "_Runs all scan modes automatically and returns all results._",
             parse_mode="Markdown",
         )
         return
-    await _run_scan_command(
-        msg,
-        target_url         = parts[1].strip(),
-        interact_selector  = parts[2].strip(),
-    )
 
+    raw_url        = parts[1].strip()
+    extra_selector: Optional[str] = None
+    filter_domain:  Optional[str] = None
 
-@dp.message(Command("scan_filter"))
-async def cmd_scan_filter(msg: Message) -> None:
-    """⑤ /scan_filter <url> <domain_filter>"""
-    parts = (msg.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await msg.reply(
-            "Usage: `/scan_filter https://app.com api.app.com`\n"
-            "Only captures requests to the specified domain.",
-            parse_mode="Markdown",
-        )
-        return
-    await _run_scan_command(
+    # Parse optional args: #selector and filter:domain (any order)
+    for arg in parts[2:]:
+        arg = arg.strip()
+        if arg.startswith("filter:"):
+            filter_domain = arg[7:]
+        elif arg.startswith("#") or arg.startswith(".") or arg.startswith("["):
+            extra_selector = arg
+        else:
+            # Could be a bare domain filter or a selector — heuristic
+            if "." in arg and "/" not in arg and not arg.startswith(("button", "input")):
+                filter_domain = arg
+            else:
+                extra_selector = arg
+
+    await _run_full_scan(
         msg,
-        target_url    = parts[1].strip(),
-        filter_domain = parts[2].strip(),
+        target_url     = raw_url,
+        extra_selector = extra_selector,
+        filter_domain  = filter_domain,
     )
 
 
